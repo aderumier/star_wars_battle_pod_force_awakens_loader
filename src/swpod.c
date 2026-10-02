@@ -201,7 +201,10 @@ int __cdecl hasp_enable_trace(unsigned l, const char *p) { return HASP_STATUS_OK
 int __cdecl hasp_login_ex(void) { return HASP_STATUS_OK; }
 int __cdecl hasp_get_version(unsigned *ma, unsigned *mi, unsigned *bs, unsigned *bn, const void *v)
 {
-    if (ma) *ma = 4; if (mi) *mi = 0; if (bs) *bs = 0; if (bn) *bn = 0;
+    if (ma) *ma = 4;
+    if (mi) *mi = 0;
+    if (bs) *bs = 0;
+    if (bn) *bn = 0;
     return HASP_STATUS_OK;
 }
 int __cdecl hasp_detach(void) { return HASP_STATUS_OK; }
