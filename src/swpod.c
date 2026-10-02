@@ -223,7 +223,7 @@ typedef struct { WORD wButtons; BYTE bLeftTrigger, bRightTrigger; SHORT sThumbLX
 typedef struct { DWORD dwPacketNumber; XPAD Gamepad; } XINSTATE;
 typedef DWORD (WINAPI *XInputGetState_t)(DWORD, XINSTATE *);
 static XInputGetState_t real_XInputGetState;
-static int pad_index;
+static int pad_index, pad_ystick;
 
 static struct {
     BYTE dig[IN_COUNT];
@@ -241,6 +241,7 @@ static void input_config(void)
         in_pad[i] = ini_int("XInput", in_names[i], in_def_pad[i]);
     }
     pad_index = ini_int("XInput", "PadIndex", 0);
+    pad_ystick = ini_int("XInput", "YStick", 1);
     axis_kbd_speed = ini_int("Keyboard", "AxisSpeed", 16);
 }
 
@@ -279,12 +280,14 @@ static void input_poll(void)
     if (have_pad) {
         XPAD *g = &st.Gamepad;
         if (kx == 0x80) io.x = stick_to_byte(g->sThumbLX);
-        if (ky == 0x80) io.y = (BYTE)~stick_to_byte(g->sThumbLY);  /* stick up = push forward */
+        /* Y on the right stick (YStick=1, default) or the left one; stick
+         * down = same as the Up arrow key (pitch up), like a flight stick */
+        if (ky == 0x80) io.y = stick_to_byte(pad_ystick ? g->sThumbRY : g->sThumbLY);
         if (kt == 0x80) io.throttle = (BYTE)(0x80 + (g->bRightTrigger - g->bLeftTrigger) / 2);
         /* default pad buttons when not mapped in ini */
         if (!in_pad[IN_START]) io.dig[IN_START] |= !!(g->wButtons & 0x0010);
-        if (!in_pad[IN_TRIGGER]) io.dig[IN_TRIGGER] |= !!(g->wButtons & 0x1000);     /* A */
-        if (!in_pad[IN_WEAPON]) io.dig[IN_WEAPON] |= !!(g->wButtons & 0x2000);       /* B */
+        if (!in_pad[IN_TRIGGER]) io.dig[IN_TRIGGER] |= !!(g->wButtons & 0x1200);     /* A or RB */
+        if (!in_pad[IN_WEAPON]) io.dig[IN_WEAPON] |= !!(g->wButtons & 0x2100);       /* B or LB */
         if (!in_pad[IN_VIEW]) io.dig[IN_VIEW] |= !!(g->wButtons & 0x8000);           /* Y */
         if (!in_pad[IN_ENTER]) io.dig[IN_ENTER] |= !!(g->wButtons & 0x4000);         /* X */
         if (!in_pad[IN_MENU_UP]) io.dig[IN_MENU_UP] |= !!(g->wButtons & 0x0001);     /* dpad */
@@ -292,6 +295,23 @@ static void input_poll(void)
     }
     if (ini_int("General", "ReverseY", 0)) io.y = (BYTE)~io.y;
     if (ini_int("General", "ReverseThrottle", 0)) io.throttle = (BYTE)~io.throttle;
+
+    /* the cabinet's test switch is a latching switch: the game stays in the
+     * test menu only while it is on, so make the key toggle it */
+    if (ini_int("General", "TestToggle", 1)) {
+        static int test_prev, test_on;
+        if (io.dig[IN_TEST] && !test_prev) test_on = !test_on;
+        test_prev = io.dig[IN_TEST];
+        io.dig[IN_TEST] = (BYTE)test_on;
+    }
+
+    if (ini_int("Debug", "InputLog", 0)) {
+        static char prev[64];
+        char cur[64]; int o = 0, k;
+        for (k = 0; k < IN_COUNT; k++) cur[o++] = io.dig[k] ? '1' : '0';
+        o += wsprintfA(cur + o, " t%02x x%02x y%02x pad%d", io.throttle, io.x, io.y, have_pad);
+        if (strcmp(cur, prev)) { logf("input %s", cur); memcpy(prev, cur, o + 1); }
+    }
 
     coin = io.dig[IN_COIN];
     if (coin_prev && !coin) io.coins++;  /* count on release, like TeknoParrot */
@@ -463,8 +483,8 @@ static void jvs_feed(const BYTE *buf, DWORD n)
     }
 }
 
-typedef HANDLE (WINAPI *CreateFileA_t)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-static CreateFileA_t real_CreateFileA;
+static HANDLE (WINAPI *real_CreateFileA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+static HANDLE (WINAPI *real_CreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static BOOL (WINAPI *real_ReadFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 static BOOL (WINAPI *real_WriteFile)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
 static BOOL (WINAPI *real_CloseHandle)(HANDLE);
@@ -473,20 +493,46 @@ static BOOL (WINAPI *real_GetCommState)(HANDLE, LPDCB);
 static BOOL (WINAPI *real_SetCommState)(HANDLE, LPDCB);
 static BOOL (WINAPI *real_SetCommTimeouts)(HANDLE, LPCOMMTIMEOUTS);
 static BOOL (WINAPI *real_PurgeComm)(HANDLE, DWORD);
+static BOOL (WINAPI *real_ClearCommError)(HANDLE, LPDWORD, LPCOMSTAT);
+
+static char jvs_port[16] = "COM3";
+
+/* name is "COMn" or "\\.\COMn" (ANSI, converted from W by the caller) */
+static int is_jvs_port(const char *name)
+{
+    if (!strncmp(name, "\\\\.\\", 4)) name += 4;
+    return !lstrcmpiA(name, jvs_port);
+}
+
+static HANDLE jvs_open(const char *name)
+{
+    logf("JVS port %s opened (emulated)", name);
+    if (!jvs_handle) jvs_handle = CreateEventW(NULL, TRUE, TRUE, NULL);
+    EnterCriticalSection(&jvs_cs);
+    jvs_addressed = 0; jvs_in_len = jvs_out_len = jvs_out_pos = 0;
+    LeaveCriticalSection(&jvs_cs);
+    return jvs_handle;
+}
 
 static HANDLE WINAPI h_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                    DWORD disp, DWORD flags, HANDLE tmpl)
 {
-    const char *n = name;
-    if (!strncmp(n, "\\\\.\\", 4)) n += 4;
-    if (!lstrcmpiA(n, "COM3") || !lstrcmpiA(n, "COM2")) {
-        logf("JVS port %s opened (emulated)", name);
-        if (!jvs_handle) jvs_handle = CreateEventW(NULL, TRUE, TRUE, NULL);
-        jvs_addressed = 0; jvs_in_len = jvs_out_len = jvs_out_pos = 0;
-        return jvs_handle;
-    }
+    if (name && is_jvs_port(name)) return jvs_open(name);
+    if (name && (!strncmp(name, "COM", 3) || !strncmp(name, "\\\\.\\", 4))) logf("CreateFileA %s", name);
     return real_CreateFileA(name, acc, share, sa, disp, flags, tmpl);
 }
+
+static HANDLE WINAPI h_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa,
+                                   DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    char a[MAX_PATH] = "";
+    if (name) WideCharToMultiByte(CP_ACP, 0, name, -1, a, sizeof(a), NULL, NULL);
+    if (name && is_jvs_port(a)) return jvs_open(a);
+    if (name && (!strncmp(a, "COM", 3) || !strncmp(a, "\\\\.\\", 4))) logf("CreateFileW %s", a);
+    return real_CreateFileW(name, acc, share, sa, disp, flags, tmpl);
+}
+
+static int jvs_pending(void) { return jvs_out_len - jvs_out_pos; }
 
 static BOOL WINAPI h_ReadFile(HANDLE h, LPVOID buf, DWORD n, LPDWORD rd, LPOVERLAPPED ov)
 {
@@ -542,19 +588,37 @@ static BOOL WINAPI h_PurgeComm(HANDLE h, DWORD f)
     LeaveCriticalSection(&jvs_cs);
     return TRUE;
 }
-
-static void jvs_install(void)
+static BOOL WINAPI h_ClearCommError(HANDLE h, LPDWORD err, LPCOMSTAT st)
 {
-    HMODULE m = GetModuleHandleA("wajvio_com.dll");
-    if (!m) { logf("wajvio_com.dll not loaded, JVS emulation disabled"); return; }
-    InitializeCriticalSection(&jvs_cs);
-    jvs_trace = ini_int("Debug", "JvsTrace", 0);
-#define H(name) real_##name = iat_hook(m, "KERNEL32.dll", #name, h_##name); \
-    if (!real_##name) logf("IAT hook %s failed", #name)
-    H(CreateFileA); H(ReadFile); H(WriteFile); H(CloseHandle); H(GetCommModemStatus);
-    H(GetCommState); H(SetCommState); H(SetCommTimeouts); H(PurgeComm);
+    if (h != jvs_handle || !h) return real_ClearCommError(h, err, st);
+    if (err) *err = 0;
+    if (st) {
+        memset(st, 0, sizeof(*st));
+        EnterCriticalSection(&jvs_cs);
+        st->cbInQue = jvs_pending();
+        LeaveCriticalSection(&jvs_cs);
+    }
+    return TRUE;
+}
+
+/* emulate the JVS board on the serial port used by module m (kernel32 IAT) */
+static void jvs_install(HMODULE m, const char *what)
+{
+    static int once;
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (!m) { logf("%s not loaded, JVS emulation disabled", what); return; }
+    if (!once) {
+        once = 1;
+        InitializeCriticalSection(&jvs_cs);
+        jvs_trace = ini_int("Debug", "JvsTrace", 0);
+        GetPrivateProfileStringA("General", "JvsPort", "COM3", jvs_port, sizeof(jvs_port), g_ini);
+    }
+#define H(name) do { void *o = iat_hook(m, "KERNEL32.dll", #name, h_##name); \
+        if (!real_##name) real_##name = o ? o : (void *)GetProcAddress(k32, #name); } while (0)
+    H(CreateFileA); H(CreateFileW); H(ReadFile); H(WriteFile); H(CloseHandle); H(GetCommModemStatus);
+    H(GetCommState); H(SetCommState); H(SetCommTimeouts); H(PurgeComm); H(ClearCommError);
 #undef H
-    logf("JVS emulation installed on wajvio_com.dll");
+    logf("JVS emulation installed on %s (port %s)", what, jvs_port);
 }
 
 /* ----------------------------------------------------------------- XInput */
@@ -572,12 +636,52 @@ static DWORD WINAPI h_XInputSetState(DWORD idx, void *vib) { return 0; }
 
 static void patches_launcher(BYTE *base)
 {
-    (void)base;
+    /* projector monitor thread (started at 0x3bf12): opens COM1 and raises
+     * error 0x31 "23-08 PROJECTOR OTHER ERROR" when absent -> exit at once */
+    patch("projector thread", base, 0x3e4d0, "\x40\x53\x55\x56", "\x31\xC0\xC3\x90", 4);
+
+    /* game mode argument: cabinet type/6 == 1 -> "-FLATSCREEN", 2 -> "-PREMIUM",
+     * else dome (concave projection warp). Force the flat-screen render. */
+    if (ini_int("General", "FlatScreen", 1))
+        patch("flatscreen", base, 0x32475, "\x75\x09", "\x90\x90", 2);
+}
+
+/* "USB DONGLE" = a USB key (not the HASP) found by enumerating USB devices
+ * through SetupDi (game 0x20b0). The caller (0x9dc110) wants exactly one
+ * device, word +0x22 == 0x0c10 and a 12-wchar serial at +0x428 matching
+ * the live serial template (decrypted at runtime; [0x150d810] picks which). Otherwise:
+ * 0 devices -> 19-22, >1 -> 0x37, wrong id/serial -> 19-21. */
+static BYTE *g_game_base;
+
+static int __cdecl h_usb_key_enum(int a, int b, unsigned short c, unsigned short d, BYTE *out)
+{
+    /* the serial template is decrypted at runtime (file: "******22****",
+     * live: "27431022****"), so build the serial from the live one */
+    const char *tmpl = (const char *)g_game_base +
+        (*(DWORD *)(g_game_base + 0x150d810) ? 0x12b4c98 : 0x1573d28);
+    static int logged;
+    char serial[13];
+    int i;
+    for (i = 0; i < 12; i++) serial[i] = (tmpl[i] == '*' || !tmpl[i]) ? '0' : tmpl[i];
+    serial[12] = 0;
+    memset(out, 0, 0x628);
+    *(WORD *)(out + 0x22) = 0x0c10;
+    for (i = 0; i < 12; i++) ((WCHAR *)(out + 0x428))[i] = serial[i];
+    if (!logged++) logf("USB key enumeration -> 1 device, serial %s (polled every 3 s)", serial);
+    return 1;
+}
+
+static void detour(const char *what, BYTE *at, const void *expect, void *fn)
+{
+    BYTE j[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };  /* mov rax, fn; jmp rax */
+    memcpy(j + 2, &fn, 8);
+    patch(what, at, 0, expect, j, sizeof(j));
 }
 
 static void patches_game(BYTE *base)
 {
-    (void)base;
+    g_game_base = base;
+    detour("usb key enum", base + 0x20b0, "\x40\x55\x57\x41\x55\x41\x56\x41\x57\x48\x8d\xac", h_usb_key_enum);
 }
 
 /* ------------------------------------------------------------------- init */
@@ -611,12 +715,18 @@ static void init(void)
     hasp_init();
 
     if (g_is_launcher) {
+        input_config();
+        real_XInputGetState = (XInputGetState_t)GetProcAddress(LoadLibraryA("xinput1_3.dll"), "XInputGetState");
+        jvs_install(GetModuleHandleA(NULL), "RSLauncher.exe");
         patches_launcher((BYTE *)GetModuleHandleA(NULL));
     } else if (g_is_game) {
         HMODULE xi = LoadLibraryA("xinput1_3.dll");
         input_config();
         real_XInputGetState = (XInputGetState_t)GetProcAddress(xi, "XInputGetState");
-        jvs_install();
+        /* the game uses wajvio.dll (WAJVOpen("COM3")); wajvio_com.dll is the
+         * same library with WAJVCom* names - hook both */
+        jvs_install(GetModuleHandleA("wajvio.dll"), "wajvio.dll");
+        jvs_install(GetModuleHandleA("wajvio_com.dll"), "wajvio_com.dll");
         if (ini_int("General", "BlockGameXInput", 1)) {
             iat_hook_ex(NULL, "XINPUT1_3.dll", NULL, 2, h_XInputGetState);
             iat_hook_ex(NULL, "XINPUT1_3.dll", NULL, 3, h_XInputSetState);

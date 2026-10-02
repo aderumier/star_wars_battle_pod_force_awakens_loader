@@ -7,5 +7,7 @@ for d in "$GAME/Launcher" "$GAME/Binaries/Win64"; do
     [ -f "$d/$DLL.orig" ] || cp "$d/$DLL" "$d/$DLL.orig"
     cp "$(dirname "$0")/build/$DLL" "$d/$DLL"
 done
+# DXVK next to the game exe (app-local, loaded via WINEDLLOVERRIDES in run.sh)
+cp "$(dirname "$0")"/dxvk/*.dll "$GAME/Binaries/Win64/"
 [ -f "$GAME/swpod.ini" ] || cp "$(dirname "$0")/swpod.ini" "$GAME/swpod.ini"
 echo installed
