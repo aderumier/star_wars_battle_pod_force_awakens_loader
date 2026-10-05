@@ -159,9 +159,22 @@ int __cdecl hasp_get_size(int h, unsigned fileid, unsigned *size)
     if (size) *size = sizeof(hasp_buffer);
     return HASP_STATUS_OK;
 }
+static BYTE *g_game_base;
+
 int __cdecl hasp_read(int h, unsigned fileid, unsigned off, unsigned len, void *buf)
 {
     logf("hasp_read fileid=%#x off=%#x len=%#x", fileid, off, len);
+    /* without -Language=JPN the game checks the HASP instead of the USB key
+     * (game 0x9dbdc0): the serial at 0xd00 must start with the same 6 chars
+     * as the runtime-decrypted template at 0x1573d28 ("******22****" on file) */
+    if (g_game_base && off <= 0xd00 && off + len >= 0xd0c) {
+        const char *tmpl = (const char *)g_game_base + 0x1573d28;
+        static int logged;
+        int i;
+        for (i = 0; i < 12; i++)
+            hasp_buffer[0xd00 + i] = (tmpl[i] == '*' || !tmpl[i]) ? '0' : tmpl[i];
+        if (!logged++) logf("HASP serial %s", hasp_buffer + 0xd00);
+    }
     if (off < sizeof(hasp_buffer)) {
         unsigned n = len;
         if (off + n > sizeof(hasp_buffer)) n = sizeof(hasp_buffer) - off;
@@ -710,6 +723,7 @@ static void patches_launcher(BYTE *base)
         char lang[16];
         int i;
         GetPrivateProfileStringA("General", "Language", "Setting", lang, sizeof(lang), g_ini);
+        if (!lstrcmpiA(lang, "INT")) lstrcpyA(lang, "ENG");
         for (i = 0; i < 9; i++)
             if (!lstrcmpiA(lang, langs[i])) {
                 BYTE mov[6] = { 0xB8, (BYTE)i, 0, 0, 0, 0x90 };
@@ -724,23 +738,26 @@ static void patches_launcher(BYTE *base)
  * device, word +0x22 == 0x0c10 and a 12-wchar serial at +0x428 matching
  * the live serial template (decrypted at runtime; [0x150d810] picks which). Otherwise:
  * 0 devices -> 19-22, >1 -> 0x37, wrong id/serial -> 19-21. */
-static BYTE *g_game_base;
 
 static int __cdecl h_usb_key_enum(int a, int b, unsigned short c, unsigned short d, BYTE *out)
 {
     /* the serial template is decrypted at runtime (file: "******22****",
-     * live: "27431022****"), so build the serial from the live one */
-    const char *tmpl = (const char *)g_game_base +
-        (*(DWORD *)(g_game_base + 0x150d810) ? 0x12b4c98 : 0x1573d28);
+     * live: "27431022****"), so build the serial from the live one. With
+     * [0x2022254] != 1 and [0x150d810] == 0 (no -Language=JPN) the caller
+     * first checks the HASP, then wants the "TFA KEY": id 0x0c20, template
+     * 0x1573d48 (else error 0x39 = 20-01) */
+    int tfa = *(DWORD *)(g_game_base + 0x2022254) != 1 && !*(DWORD *)(g_game_base + 0x150d810);
+    const char *tmpl = (const char *)g_game_base + (tfa ? 0x1573d48 :
+        *(DWORD *)(g_game_base + 0x150d810) ? 0x12b4c98 : 0x1573d28);
     static int logged;
     char serial[13];
     int i;
     for (i = 0; i < 12; i++) serial[i] = (tmpl[i] == '*' || !tmpl[i]) ? '0' : tmpl[i];
     serial[12] = 0;
     memset(out, 0, 0x628);
-    *(WORD *)(out + 0x22) = 0x0c10;
+    *(WORD *)(out + 0x22) = tfa ? 0x0c20 : 0x0c10;
     for (i = 0; i < 12; i++) ((WCHAR *)(out + 0x428))[i] = serial[i];
-    if (!logged++) logf("USB key enumeration -> 1 device, serial %s (polled every 3 s)", serial);
+    if (!logged++) logf("USB key enumeration -> 1 device%s, serial %s (polled every 3 s)", tfa ? " (TFA key)" : "", serial);
     return 1;
 }
 
