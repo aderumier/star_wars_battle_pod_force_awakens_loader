@@ -226,7 +226,7 @@ typedef struct { WORD wButtons; BYTE bLeftTrigger, bRightTrigger; SHORT sThumbLX
 typedef struct { DWORD dwPacketNumber; XPAD Gamepad; } XINSTATE;
 typedef DWORD (WINAPI *XInputGetState_t)(DWORD, XINSTATE *);
 static XInputGetState_t real_XInputGetState;
-static int pad_index, pad_deadzone;
+static int pad_index, pad_deadzone, pad_stick_dz;
 
 static struct {
     BYTE dig[IN_COUNT];
@@ -245,10 +245,13 @@ static void input_config(void)
     }
     pad_index = ini_int("XInput", "PadIndex", 0);
     pad_deadzone = ini_int("XInput", "ThrottleDeadzone", 8689);
+    pad_stick_dz = ini_int("XInput", "StickDeadzone", 2500);
     axis_kbd_speed = ini_int("Keyboard", "AxisSpeed", 16);
 }
 
 static int key_down(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000); }
+
+static SHORT deadzone(SHORT v, int dz) { return v > -dz && v < dz ? 0 : v; }
 
 static BYTE stick_to_byte(SHORT v) { return (BYTE)((v + 32768) >> 8); }
 
@@ -284,21 +287,20 @@ static void input_poll(void)
         XPAD *g = &st.Gamepad;
         /* left stick = joystick; stick down = same as the Up arrow key
          * (pitch up), like a flight stick */
-        if (kx == 0x80) io.x = stick_to_byte(g->sThumbLX);
-        if (ky == 0x80) io.y = stick_to_byte(g->sThumbLY);
+        if (kx == 0x80) io.x = stick_to_byte(deadzone(g->sThumbLX, pad_stick_dz));
+        if (ky == 0x80) io.y = stick_to_byte(deadzone(g->sThumbLY, pad_stick_dz));
         /* throttle: right stick up / RT accelerate, right stick down / LT brake */
         if (kt == 0x80) {
-            int ry = g->sThumbRY, t;
-            if (ry > -pad_deadzone && ry < pad_deadzone) ry = 0;
+            int ry = deadzone(g->sThumbRY, pad_deadzone), t;
             t = 0x80 + (g->bRightTrigger - g->bLeftTrigger) / 2 + ry / 256;
             io.throttle = (BYTE)(t < 0 ? 0 : t > 255 ? 255 : t);
         }
         /* default pad buttons when not mapped in ini */
         if (!in_pad[IN_START]) io.dig[IN_START] |= !!(g->wButtons & 0x0010);
-        if (!in_pad[IN_TRIGGER]) io.dig[IN_TRIGGER] |= !!(g->wButtons & 0x1200);     /* A or RB */
-        if (!in_pad[IN_WEAPON]) io.dig[IN_WEAPON] |= !!(g->wButtons & 0x2100);       /* B or LB */
-        if (!in_pad[IN_VIEW]) io.dig[IN_VIEW] |= !!(g->wButtons & 0x4000);           /* X */
-        if (!in_pad[IN_ENTER]) io.dig[IN_ENTER] |= !!(g->wButtons & 0x8000);         /* Y */
+        if (!in_pad[IN_TRIGGER]) io.dig[IN_TRIGGER] |= !!(g->wButtons & 0x4200);     /* X or RB */
+        if (!in_pad[IN_WEAPON]) io.dig[IN_WEAPON] |= !!(g->wButtons & 0x1100);       /* A or LB */
+        if (!in_pad[IN_VIEW]) io.dig[IN_VIEW] |= !!(g->wButtons & 0x8000);           /* Y */
+        if (!in_pad[IN_ENTER]) io.dig[IN_ENTER] |= !!(g->wButtons & 0x2000);         /* B */
         if (!in_pad[IN_MENU_UP]) io.dig[IN_MENU_UP] |= !!(g->wButtons & 0x0001);     /* dpad */
         if (!in_pad[IN_MENU_DOWN]) io.dig[IN_MENU_DOWN] |= !!(g->wButtons & 0x0002);
     }
@@ -646,6 +648,47 @@ static DWORD WINAPI h_XInputGetState(DWORD idx, XINSTATE *s)
 }
 static DWORD WINAPI h_XInputSetState(DWORD idx, void *vib) { return 0; }
 
+/* it also enumerates DirectInput game controllers (pad buttons would act
+ * on their own, e.g. R1 = view): drop everything but keyboard and mouse */
+typedef BOOL (CALLBACK *DIENUMCB)(const void *ddi, void *ref);
+typedef HRESULT (WINAPI *EnumDevices_t)(void *self, DWORD type, DIENUMCB cb, void *ref, DWORD flags);
+typedef HRESULT (WINAPI *DirectInput8Create_t)(HINSTANCE, DWORD, const GUID *, void **, void *);
+static DirectInput8Create_t real_DirectInput8Create;
+static struct { void **vt; EnumDevices_t real; } di_vt[4];  /* A and W interfaces */
+struct di_enum { DIENUMCB cb; void *ref; };
+
+static BOOL CALLBACK di_enum_filter(const void *ddi, void *ref)
+{
+    struct di_enum *e = ref;
+    BYTE type = (BYTE)*(const DWORD *)((const BYTE *)ddi + 36);  /* DIDEVICEINSTANCE.dwDevType */
+    if (type != 0x12 && type != 0x13) return TRUE;               /* DI8DEVTYPE_MOUSE/KEYBOARD */
+    return e->cb(ddi, e->ref);
+}
+static HRESULT WINAPI h_EnumDevices(void *self, DWORD type, DIENUMCB cb, void *ref, DWORD flags)
+{
+    struct di_enum e = { cb, ref };
+    int i;
+    for (i = 0; i < 4; i++)
+        if (di_vt[i].vt == *(void ***)self) return di_vt[i].real(self, type, di_enum_filter, &e, flags);
+    return E_FAIL;
+}
+static HRESULT WINAPI h_DirectInput8Create(HINSTANCE h, DWORD ver, const GUID *riid, void **out, void *outer)
+{
+    HRESULT r = real_DirectInput8Create(h, ver, riid, out, outer);
+    if (r == 0 && out && *out) {
+        void **vt = *(void ***)*out, *fn = h_EnumDevices;
+        int i;
+        for (i = 0; i < 4 && vt[4] != fn; i++)
+            if (!di_vt[i].vt) {  /* EnumDevices is slot 4 in both A and W vtables */
+                di_vt[i].vt = vt;
+                di_vt[i].real = vt[4];
+                mem_write(&vt[4], &fn, sizeof(fn));
+                logf("DirectInput game controllers hidden from the game");
+            }
+    }
+    return r;
+}
+
 /* ---------------------------------------------------------------- patches */
 
 static void patches_launcher(BYTE *base)
@@ -760,6 +803,7 @@ static void init(void)
         if (ini_int("General", "BlockGameXInput", 1)) {
             iat_hook_ex(NULL, "XINPUT1_3.dll", NULL, 2, h_XInputGetState);
             iat_hook_ex(NULL, "XINPUT1_3.dll", NULL, 3, h_XInputSetState);
+            real_DirectInput8Create = iat_hook(NULL, "DINPUT8.dll", "DirectInput8Create", h_DirectInput8Create);
         }
         patches_game((BYTE *)GetModuleHandleA(NULL));
     }
