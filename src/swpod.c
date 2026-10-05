@@ -218,7 +218,7 @@ static const char *in_names[IN_COUNT] = { "Test", "Service", "Coin", "Start", "T
                                           "View", "MenuUp", "MenuDown", "Enter" };
 /* defaults: keyboard VK | (xinput button << 16) */
 static const int in_def_key[IN_COUNT] = { VK_F2, VK_F1, '5', '1', VK_SPACE, VK_CONTROL, 'V',
-                                          VK_PRIOR, VK_NEXT, VK_RETURN };
+                                          VK_HOME, VK_END, VK_RETURN };
 static const int in_def_pad[IN_COUNT] = { 0, 0, 0x0020, 0, 0, 0, 0, 0, 0, 0 };
 static int in_key[IN_COUNT], in_pad[IN_COUNT];
 
@@ -226,7 +226,7 @@ typedef struct { WORD wButtons; BYTE bLeftTrigger, bRightTrigger; SHORT sThumbLX
 typedef struct { DWORD dwPacketNumber; XPAD Gamepad; } XINSTATE;
 typedef DWORD (WINAPI *XInputGetState_t)(DWORD, XINSTATE *);
 static XInputGetState_t real_XInputGetState;
-static int pad_index, pad_ystick;
+static int pad_index, pad_deadzone;
 
 static struct {
     BYTE dig[IN_COUNT];
@@ -244,7 +244,7 @@ static void input_config(void)
         in_pad[i] = ini_int("XInput", in_names[i], in_def_pad[i]);
     }
     pad_index = ini_int("XInput", "PadIndex", 0);
-    pad_ystick = ini_int("XInput", "YStick", 1);
+    pad_deadzone = ini_int("XInput", "ThrottleDeadzone", 8689);
     axis_kbd_speed = ini_int("Keyboard", "AxisSpeed", 16);
 }
 
@@ -277,22 +277,28 @@ static void input_poll(void)
 
     kx = kbd_axis(kx, key_down(VK_LEFT), key_down(VK_RIGHT));
     ky = kbd_axis(ky, key_down(VK_UP), key_down(VK_DOWN));
-    kt = kbd_axis(kt, key_down('S'), key_down('W'));
+    kt = kbd_axis(kt, key_down(VK_NEXT), key_down(VK_PRIOR));
     io.x = kx; io.y = ky; io.throttle = kt;
 
     if (have_pad) {
         XPAD *g = &st.Gamepad;
+        /* left stick = joystick; stick down = same as the Up arrow key
+         * (pitch up), like a flight stick */
         if (kx == 0x80) io.x = stick_to_byte(g->sThumbLX);
-        /* Y on the right stick (YStick=1, default) or the left one; stick
-         * down = same as the Up arrow key (pitch up), like a flight stick */
-        if (ky == 0x80) io.y = stick_to_byte(pad_ystick ? g->sThumbRY : g->sThumbLY);
-        if (kt == 0x80) io.throttle = (BYTE)(0x80 + (g->bRightTrigger - g->bLeftTrigger) / 2);
+        if (ky == 0x80) io.y = stick_to_byte(g->sThumbLY);
+        /* throttle: right stick up / RT accelerate, right stick down / LT brake */
+        if (kt == 0x80) {
+            int ry = g->sThumbRY, t;
+            if (ry > -pad_deadzone && ry < pad_deadzone) ry = 0;
+            t = 0x80 + (g->bRightTrigger - g->bLeftTrigger) / 2 + ry / 256;
+            io.throttle = (BYTE)(t < 0 ? 0 : t > 255 ? 255 : t);
+        }
         /* default pad buttons when not mapped in ini */
         if (!in_pad[IN_START]) io.dig[IN_START] |= !!(g->wButtons & 0x0010);
         if (!in_pad[IN_TRIGGER]) io.dig[IN_TRIGGER] |= !!(g->wButtons & 0x1200);     /* A or RB */
         if (!in_pad[IN_WEAPON]) io.dig[IN_WEAPON] |= !!(g->wButtons & 0x2100);       /* B or LB */
-        if (!in_pad[IN_VIEW]) io.dig[IN_VIEW] |= !!(g->wButtons & 0x8000);           /* Y */
-        if (!in_pad[IN_ENTER]) io.dig[IN_ENTER] |= !!(g->wButtons & 0x4000);         /* X */
+        if (!in_pad[IN_VIEW]) io.dig[IN_VIEW] |= !!(g->wButtons & 0x4000);           /* X */
+        if (!in_pad[IN_ENTER]) io.dig[IN_ENTER] |= !!(g->wButtons & 0x8000);         /* Y */
         if (!in_pad[IN_MENU_UP]) io.dig[IN_MENU_UP] |= !!(g->wButtons & 0x0001);     /* dpad */
         if (!in_pad[IN_MENU_DOWN]) io.dig[IN_MENU_DOWN] |= !!(g->wButtons & 0x0002);
     }
@@ -306,6 +312,11 @@ static void input_poll(void)
         if (io.dig[IN_TEST] && !test_prev) test_on = !test_on;
         test_prev = io.dig[IN_TEST];
         io.dig[IN_TEST] = (BYTE)test_on;
+    }
+    /* in the test menu, the Up/Down arrows also move the menu cursor */
+    if (io.dig[IN_TEST]) {
+        io.dig[IN_MENU_UP] |= key_down(VK_UP) ? 1 : 0;
+        io.dig[IN_MENU_DOWN] |= key_down(VK_DOWN) ? 1 : 0;
     }
 
     if (ini_int("Debug", "InputLog", 0)) {
@@ -647,6 +658,22 @@ static void patches_launcher(BYTE *base)
      * else dome (concave projection warp). Force the flat-screen render. */
     if (ini_int("General", "FlatScreen", 1))
         patch("flatscreen", base, 0x32475, "\x75\x09", "\x90\x90", 2);
+
+    /* game language argument: [0x33cb60] = operator setting varSettingLanguage,
+     * 1..8 -> "-Language=JPN/CHN/ITA/SPA/RUS/POR/IND/THA", else none (INT =
+     * English). Replace that read with "mov eax, lang" unless Language=Setting. */
+    {
+        static const char *langs[] = { "ENG", "JPN", "CHN", "ITA", "SPA", "RUS", "POR", "IND", "THA" };
+        char lang[16];
+        int i;
+        GetPrivateProfileStringA("General", "Language", "Setting", lang, sizeof(lang), g_ini);
+        for (i = 0; i < 9; i++)
+            if (!lstrcmpiA(lang, langs[i])) {
+                BYTE mov[6] = { 0xB8, (BYTE)i, 0, 0, 0, 0x90 };
+                patch("language", base, 0x324ef, "\x8b\x05\x6b\xa6\x30\x00", mov, 6);
+                logf("game language forced to %s", langs[i]);
+            }
+    }
 }
 
 /* "USB DONGLE" = a USB key (not the HASP) found by enumerating USB devices
